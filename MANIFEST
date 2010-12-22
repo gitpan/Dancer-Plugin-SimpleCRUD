@@ -1,0 +1,18 @@
+Changes
+MANIFEST
+Makefile.PL
+README
+lib/Dancer/Plugin/SimpleCRUD.pm
+t/00-load.t
+t/manifest.t
+t/pod-coverage.t
+t/pod.t
+example/config.yml
+example/logs/development.log
+example/README.pod
+example/schema.sql
+example/simplecrud-example.pl
+example/test.sqlite
+example/views/contentwrapper.tt
+example/views/layouts/main.tt
+META.yml                                 Module meta-data (added by MakeMaker)
