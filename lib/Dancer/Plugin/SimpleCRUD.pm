@@ -33,18 +33,8 @@ use HTML::Table::FromDatabase;
 use CGI::FormBuilder;
 use SQL::Abstract;
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
-
-# Horrific bodge: if the version of Dancer in use doesn't have
-# render_with_layout(), inject our own version.  This will require a view
-# named contentwrapper.tt, which contains a token for render_content.
-if (!Dancer->can('render_with_layout')) {
-    *Dancer::render_with_layout = sub {
-        my $content = shift;
-        template('contentwrapper', { render_content => $content });
-    };
-}
 
 
 =head1 NAME
@@ -55,12 +45,14 @@ Dancer::Plugin::SimpleCRUD - very simple CRUD (create/read/update/delete)
 =head1 DESCRIPTION
 
 A plugin for Dancer web applications, to use a  few lines of code to create
-appropriate routes to support creating/editing/deleting records within a
+appropriate routes to support creating/editing/deleting/viewing records within a
 database table.  Uses L<HTML::FormFu> to generate, process and validate forms,
-and L<Dancer::Plugin::Database> for database interaction.
+L<Dancer::Plugin::Database> for database interaction and
+L<HTML::Table::FromDatabase> to display lists of records.
 
 
 =head1 SYNOPSIS
+
     # In your Dancer app,
     use Dancer::Plugin::SimpleCRUD;
 
@@ -211,10 +203,14 @@ sub simple_crud {
     $args{deletable} = delete $args{deleteable}
         if !exists $args{deletable} && exists $args{deleteable};
 
+    # Sane default values:
+    $args{key_column}   ||= 'id';
+    $args{record_title} ||= 'record';
+
     # Sanitise things we'll have to interpolate into queries (yes, that makes me
     # feel bad, but you can't use params for field/table names):
     my $table_name = $args{db_table};
-    my $key_column = $args{key_column} || 'id';
+    my $key_column = $args{key_column};
     for ($table_name, $key_column) {
         die "Invalid table name/key column - SQL injection attempt?"
             if /--/;
@@ -274,10 +270,13 @@ sub simple_crud {
         }
 
         # If the user didn't supply a list of acceptable values for a field, but
-        # it's an ENUM column, use the possible values declared in the ENUM
+        # it's an ENUM column, use the possible values declared in the ENUM.
+        # Also remember field types for easy reference later
         my %constrain_values;
+        my %field_type;
         for my $field (@$all_table_columns) {
             my $name = $field->{COLUMN_NAME};
+            $field_type{$name} = $field->{TYPE_NAME};
             if (my $values_specified = $args{acceptable_values}->{$name}) {
                 $constrain_values{$name} = $values_specified;
             } elsif (my $values_from_db = $field->{mysql_values}) {
@@ -324,6 +323,11 @@ sub simple_crud {
                 $field_params{type} = 'password';
             }
 
+            # use a <textarea> for large text fields.
+            if ($field_type{$field} eq 'TEXT') {
+                $field_params{type} = 'textarea';
+            }
+
             # OK, add the field to the form:
             $form->field(%field_params);
         }
@@ -336,7 +340,7 @@ sub simple_crud {
             # submitted with the form which don't belong in the DB, ignore them)
             my %params;
             $params{$_} = params->{$_} for @editable_columns;
-            my $sql = SQL::Abstract->new;
+            my $sql = SQL::Abstract->new( quote_char => '`' );
             my ($statement, @bind_values);
             my $verb;
             if (exists params->{$key_column}) {
@@ -357,11 +361,11 @@ sub simple_crud {
                 return;
             } else {
                 # TODO: better error handling
-                return "<p>Unable to $verb record</p>";
+                return "<p>Unable to $verb $args{record_title}</p>";
             }
 
         } else {
-            return Dancer::render_with_layout($form->render);
+            return engine('template')->apply_layout($form->render);
         }
     };
     Dancer::Logger::debug("Setting up routes for $args{prefix}/add etc");
@@ -421,7 +425,7 @@ function delrec(record_id) {
 </script>
 
 DELETEJS
-        return Dancer::render_with_layout($html);
+        return engine('template')->apply_layout($html);
     };
 
     # If we should allow deletion of records, set up routes to handle that,
@@ -433,7 +437,7 @@ DELETEJS
         # support Javascript, otherwise the list page will have POSTed the ID 
         # to us) (or they just came here directly for some reason)
         get "$args{prefix}/delete/:id" => sub {
-            return Dancer::render_with_layout(<<CONFIRMDELETE);
+            return engine('template')->apply_layout(<<CONFIRMDELETE);
 <p>
 Do you really wish to delete this record?
 </p>
