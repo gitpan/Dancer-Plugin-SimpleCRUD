@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               Dancer-Plugin-SimpleCRUD
-version:            0.03
+version:            0.04
 abstract:           very simple CRUD (create/read/update/delete)
 author:
     - David Precious <davidp@preshweb.co.uk>

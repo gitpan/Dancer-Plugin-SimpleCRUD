@@ -32,7 +32,7 @@ use Dancer::Plugin::Database;
 use HTML::Table::FromDatabase;
 use CGI::FormBuilder;
 
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 
 =head1 NAME
 
@@ -493,7 +493,7 @@ SEARCHFORM
                      ],
       );
 
-    $html .= $table->getTable;
+    $html .= $table->getTable || '';
     $html .= sprintf '<a href="%s">Add a new %s</a></p>',
       $args->{prefix} . '/add', $args->{record_title};
 
