@@ -36,7 +36,7 @@ use Dancer::Plugin::Database;
 use HTML::Table::FromDatabase;
 use CGI::FormBuilder;
 
-our $VERSION = '0.20';
+our $VERSION = '0.30';
 
 =head1 NAME
 
@@ -85,7 +85,11 @@ L<HTML::Table::FromDatabase> to display lists of records.
         display_columns => [ qw( f_name l_name adr_1 ),
         deleteable => 1,
         editable => 1,
+        sortable => 1,
+        paginate => 300,
         template => 'simple_crud.tt',
+        query_auto_focus => 1,
+        downloadable => 1,
     );
 
 
@@ -179,6 +183,18 @@ given, and the edit form will have a "Delete $record_title" button.
 Specify whether to support editing records.  Defaults to true.  If set to a
 false value, it will not be possible to add or edit rows in the table.
 
+=item C<sortable>
+
+Specify whether to support sorting the table. Defaults to false. If set to a
+true value, column headers will become clickable, allowing the user to sort
+the output by each column, and with ascending/descending order.
+
+=item C<paginate>
+
+Specify whether to show results in pages (with next/previous buttons).
+Defaults to undef, meaning all records are shown on one page (not useful for large tables).
+When defined as a number, only this number of results will be shown.
+
 =item C<display_columns>
 
 Specify an arrayref of columns that should show up in the list.  Defaults to all.
@@ -190,6 +206,18 @@ a "simple_crud" placeholder defined or you won't get any output.  This template
 must be located in your "views" directory.  Any global layout will be applied
 automatically because this option causes the module to use the "template"
 keyword.
+
+=item C<query_auto_focus>
+
+Specify whether to automatically set input focus to the query input field.
+Defaults to true. If set to a false value, focus will not be set.
+The focus is set using a simple inlined javascript.
+
+=item C<downloadable>
+
+Specify whether to support downloading the results.  Defaults to false. If set to a
+true value, The results show on the HTML page can be downloaded as CSV/TSV/JSON/XML.
+The download links will appear at the top of the page.
 
 =cut
 
@@ -225,6 +253,7 @@ sub simple_crud {
     $args{key_column}   ||= 'id';
     $args{record_title} ||= 'record';
     $args{editable} = 1 unless exists $args{editable};
+    $args{query_auto_focus} = 1 unless exists $args{query_auto_focus};
 
     # Sanitise things we'll have to interpolate into queries (yes, that makes me
     # feel bad, but you can't use params for field/table names):
@@ -485,17 +514,28 @@ sub _create_list_handler {
 
     my $options = join(
 	"\n",
-	map { "<option value='$_->{COLUMN_NAME}'>$_->{COLUMN_NAME}</option>" }
+	map {	my $selected = (defined params->{searchfield}
+				&& params->{searchfield} eq $_->{COLUMN_NAME})
+				?"selected":"";
+		"<option $selected value='$_->{COLUMN_NAME}'>$_->{COLUMN_NAME}</option>" }
 	    @$columns
     );
 
+    my $order_by_param=params->{'o'} || "";
+    my $order_by_direction=params->{'d'} || "";
     my $html = <<"SEARCHFORM";
  <p><form name="searchform" method="get">
      Field:  <select name="searchfield">$options</select> &nbsp;&nbsp;
-     Query: <input name="q" type="text" size="30"/> &nbsp;&nbsp;
+     Query: <input name="q" id="searchquery" type="text" size="30"/> &nbsp;&nbsp;
+     <input name="o" type="hidden" value="$order_by_param"/>
+     <input name="d" type="hidden" value="$order_by_direction"/>
      <input name="searchsubmit" type="submit" value="Search"/>
  </form></p>
 SEARCHFORM
+
+    if ($args->{query_auto_focus}) {
+	$html .= "<script>document.getElementById(\"searchquery\").focus();</script>";
+    }
 
     # TODO: handle pagination
     # TODO: Fix me with more data types. Make this global?
@@ -534,11 +574,97 @@ SEARCHFORM
 	}
     }
 
+	if ($args->{downloadable}) {
+		my $q = params->{'q'} || "";
+		my $sf = params->{searchfield} || "";
+		my $o = params->{'o'} || "";
+		my $d = params->{'d'} || "";
+		my $page = params->{'p'} || 0 ;
+
+		my @formats = qw/csv tabular json xml/;
+
+		my $url = _construct_url($args->{prefix}) .
+			"?o=$o&d=$d&q=$q&searchfield=$sf&p=$page";
+
+		$html .="<p>Download as: " . join(", ",
+			map { "<a href=\"$url&format=$_\">$_</a>" } @formats ) . "<p>";
+	}
+
+	## Build a hash to add sorting CGI parameters + URL to each column header.
+	## (will be used with HTML::Table::FromDatabase's "-rename_columns" parameter.
+	my %columns_sort_options;
+	if ($args->{sortable}) {
+		my $q = params->{'q'} || "";
+		my $sf = params->{searchfield} || "";
+		my $order_by_column = params->{'o'} || $key_column;
+		# Invalid column name ? discard it
+		my $valid = grep { $_->{COLUMN_NAME} eq $order_by_column } @$columns;
+		$order_by_column = $key_column unless $valid;
+
+		my $order_by_direction = (exists params->{'d'} && params->{'d'} eq "desc")?"desc":"asc";
+		my $opposite_order_by_direction = ($order_by_direction eq "asc")?"desc":"asc";
+
+		%columns_sort_options = map {
+			my $col_name = $_->{COLUMN_NAME};
+			my $direction = $order_by_direction;
+			my $direction_char = "";
+			if ($col_name eq $order_by_column) {
+				$direction = $opposite_order_by_direction;
+				$direction_char = ($direction eq "asc")?"&uarr;":"&darr;";
+			}
+			my $url = _construct_url($args->{prefix}) .
+				"?o=$col_name&d=$direction&q=$q&searchfield=$sf";
+			$col_name => "<a href=\"$url\">$col_name&nbsp;$direction_char</a>";
+			} @$columns;
+
+	    $query .= " ORDER BY " . database->quote_identifier($order_by_column) .
+			" " .$order_by_direction . " " ;
+	}
+
+	if ($args->{paginate} && $args->{paginate} =~ /^\d+$/ ) {
+		my $page_size = $args->{paginate};
+
+		my $q = params->{'q'} || "";
+		my $sf = params->{searchfield} || "";
+		my $o = params->{'o'} || "";
+		my $d = params->{'d'} || "";
+		my $page = params->{'p'} || 0 ;
+		$page = 0 unless $page =~ /^\d+$/;
+
+		my $offset = $page_size * $page ;
+		my $limit = $page_size ;
+
+		my $url = _construct_url($args->{prefix}) .
+			"?o=$o&d=$d&q=$q&searchfield=$sf";
+		$html .= "<p>";
+		if ($page > 0) {
+			$html .= sprintf("<a href=\"$url&p=%d\">&larr;&nbsp;prev.&nbsp;page</a>", $page-1)
+		} else {
+			$html .= "&larr;&nbsp;prev.&nbsp;page&nbsp";
+		}
+		$html .= "&nbsp;" x 5;
+		$html .= sprintf("Showing page %d (records %d to %d)",
+				$page+1, $offset+1, $offset+1 + $limit );
+		$html .= "&nbsp;" x 5;
+		$html .= sprintf("<a href=\"$url&p=%d\">next&nbsp;page&nbsp;&rarr;</a>", $page+1);
+		$html .= "<p>";
+
+
+		$query .= " LIMIT $limit OFFSET $offset " ;
+	}
+
+
+
     debug("Running query: $query");
     my $sth = $dbh->prepare($query);
     $sth->execute()
 	or die "Failed to query for records in $table_name - "
 	. database->errstr;
+
+    if ($args->{downloadable} && params->{format} ) {
+	    ##Return results as a downloaded file, instead of generating the HTML table.
+	    return _return_downloadable_query($args, $sth, params->{format});
+    }
 
     my $table = HTML::Table::FromDatabase->new(
 	-sth       => $sth,
@@ -567,6 +693,7 @@ SEARCHFORM
 		},
 	    },
 	],
+	-rename_headers => \%columns_sort_options,
     );
 
     $html .= $table->getTable || '';
@@ -608,6 +735,72 @@ sub _apply_template {
         return engine('template')->apply_layout($html);
     }
 };
+
+sub _return_downloadable_query {
+	my ($args, $sth, $format) = @_;
+
+	my $output;
+
+	## Generate an informative filename
+	my $filename = $args->{db_table};
+	if (params->{'o'}) {
+		my $order = params->{'o'};
+		$order =~ s/[^\w\.\-]+/_/g;
+		$filename .= "__sorted_by_" . $order;
+	}
+	if (params->{'q'}) {
+		my $query = params->{'q'};
+		$query =~ s/[^\w\.\-]+/_/g;
+		$filename .= "__query_" . $query ;
+	}
+	if (params->{'p'}) {
+		my $page = params->{'p'};
+		$page =~ s/[^0-9]+/_/g;
+		$filename .= "__page_" . $page ;
+	}
+
+	## Generate data in the requested format
+	if ($format eq "tabular") {
+		header('Content-Type' => 'text/tab-separated-values');
+		header('Content-Disposition' => "attachment; filename=\"$filename.txt\"");
+		my $aref = $sth->{NAME};
+		$output = join("\t", @$aref) . "\r\n";
+		while( $aref = $sth->fetchrow_arrayref ) {
+			$output .= join("\t", @{ $aref } ) . "\r\n";
+		}
+	}
+	elsif ($format eq "csv") {
+		eval { require Text::CSV };
+		return "Error: required module Text::CSV not installed. Can't generate CSV file." if $@;
+
+		header('Content-Type' => 'text/comma-separated-values');
+		header('Content-Disposition' => "attachment; filename=\"$filename.csv\"");
+
+		my $csv = Text::CSV->new();
+		my $aref = $sth->{NAME};
+		$csv->combine( @{ $aref } );
+		$output = $csv->string() . "\r\n";
+		while( $aref = $sth->fetchrow_arrayref ) {
+			$csv->combine( @{ $aref } );
+			$output .= $csv->string() . "\r\n";
+		}
+	}
+	elsif ($format eq "json") {
+		header('Content-Type' => 'text/json');
+		header('Content-Disposition' => "attachment; filename=\"$filename.json\"");
+		$output = to_json ( $sth->fetchall_arrayref ( {} ) );
+	}
+	elsif ($format eq "xml") {
+		header('Content-Type' => 'text/xml');
+		header('Content-Disposition' => "attachment; filename=\"$filename.xml\"");
+		$output = to_xml ( $sth->fetchall_arrayref ( {} ) );
+	}
+	else  {
+		$output = "Error: unknown format $format";
+	}
+
+	return $output;
+}
 
 # Given a table name, return an arrayref of hashrefs describing each column in
 # the table.
