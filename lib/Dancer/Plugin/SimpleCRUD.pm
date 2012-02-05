@@ -36,7 +36,7 @@ use Dancer::Plugin::Database;
 use HTML::Table::FromDatabase;
 use CGI::FormBuilder;
 
-our $VERSION = '0.40';
+our $VERSION = '0.50';
 
 =head1 NAME
 
@@ -51,6 +51,10 @@ database table.  Uses L<CGI::FormBuilder> to generate, process and validate form
 L<Dancer::Plugin::Database> for database interaction and
 L<HTML::Table::FromDatabase> to display lists of records.
 
+Setting up forms and code to display and edit database records is a very common
+requirement in web apps; this plugin tries to make something basic trivially
+easy to set up and use.
+
 
 =head1 SYNOPSIS
 
@@ -62,31 +66,37 @@ L<HTML::Table::FromDatabase> to display lists of records.
         record_title => 'Widget',
         prefix => '/widgets',
         db_table => 'widgets',
+        editable => 1,
     );
 
-    # The above would create a route to handle C</widget/add> and
-    # C</widget/:id>, presenting a form to add/edit a Widget respectively.
+    # The above would create a route to handle C</widgets>, listing all widgets,
+    # with options to add/edit entries (linking to C</widgets/add> and
+    # C</widgets/edit/:id> respectively) where a form to add a new entry or edit
+    # an existing entry will be created.
     # All fields in the database table would be editable.
 
-    # A more in-depth synopsis, using all options:
+    # A more in-depth synopsis, using all options (of course, usually you'd only
+    # need to use a few of the options where you need to change the default
+    # behaviour):
+
     simple_crud(
-        record_title => 'Widget',
-        prefix => '/widgets',
-        db_table => 'widgets',
-        labels => {
-            country => 'Country of Origin',
-            type    => 'Widget Type', 
+        record_title => 'Team',
+        prefix => '/teams',
+        db_table => 'team',
+        labels => {     # More human-friendly labels for some columns
+            venue_id => 'Home Venue',
+            name     => 'Team Name', 
         },  
-        validation => {
-            weight => qr/\d+/,
+        validation => {  # validate values entered for some columns
+            division => qr/\d+/,
         },
-        input_types => {
+        input_types => {  # overriding form input type for some columns
             supersecret => 'password',
             lotsoftext' => 'textarea',
         },
-        key_column => 'sku',
-        editable_columns => [ qw( f_name l_name adr_1 ),
-        display_columns => [ qw( f_name l_name adr_1 ),
+        key_column => 'id', # id is default anyway
+        editable_columns => [ qw( venue_id name division )    ],
+        display_columns  => [ qw( id venue_id name division ) ],
         deleteable => 1,
         editable => 1,
         sortable => 1,
@@ -94,6 +104,13 @@ L<HTML::Table::FromDatabase> to display lists of records.
         template => 'simple_crud.tt',
         query_auto_focus => 1,
         downloadable => 1,
+        foreign_keys => {
+            columnname => {
+                table => 'venues',
+                key_column => 'id',
+                label_column => 'name',
+            },
+        },
     );
 
 
@@ -101,7 +118,7 @@ L<HTML::Table::FromDatabase> to display lists of records.
 =head1 USAGE
 
 This plugin provides a C<simple_crud> keyword, which takes a hash of options as
-described below, and sets up the appropriate route to present add/edit/delete
+described below, and sets up the appropriate routes to present add/edit/delete
 options.
 
 =head1 OPTIONS
@@ -205,9 +222,9 @@ the output by each column, and with ascending/descending order.
 
 =item C<paginate>
 
-Specify whether to show results in pages (with next/previous buttons).
-Defaults to undef, meaning all records are shown on one page (not useful for large tables).
-When defined as a number, only this number of results will be shown.
+Specify whether to show results in pages (with next/previous buttons).  Defaults
+to undef, meaning all records are shown on one page (not useful for large
+tables).  When defined as a number, only this number of results will be shown.
 
 =item C<display_columns>
 
@@ -229,9 +246,15 @@ The focus is set using a simple inlined javascript.
 
 =item C<downloadable>
 
-Specify whether to support downloading the results.  Defaults to false. If set to a
-true value, The results show on the HTML page can be downloaded as CSV/TSV/JSON/XML.
-The download links will appear at the top of the page.
+Specify whether to support downloading the results.  Defaults to false. If set
+to a true value, The results show on the HTML page can be downloaded as
+CSV/TSV/JSON/XML.  The download links will appear at the top of the page.
+
+item C<foreign_keys>
+
+A hashref to specify columns in the table which are foreign keys; for each one,
+the value should be a hashref containing the keys C<table>, C<key_column> and
+C<label_column>.
 
 =cut
 
@@ -252,12 +275,6 @@ sub simple_crud {
     }
 
     if (!$args{db_table}) { die "Need table name!"; }
-
-    # Find out what kind of engine we're talking to:
-    my $db_type = $dbh->get_info(17);
-    if ($db_type ne 'MySQL') {
-	    warning "This module has so far only been tested with MySQL databases.";
-    }
 
     # Accept deleteable as a synonym for deletable
     $args{deletable} = delete $args{deleteable}
@@ -403,6 +420,18 @@ sub _create_add_edit_route {
                 $values_specified = $values_specified->();
             }
 	    $constrain_values{$name} = $values_specified;
+
+        } elsif (my $foreign_key = $args->{foreign_keys}{$name}) {
+            # Find out the possible values for this column from the other table:
+            my %possible_values;
+            debug "Looking for rows for foreign relation: " => $foreign_key;
+            for my $row (database->quick_select($foreign_key->{table}, {})) {
+                debug "Row from foreign relation: " => $row;
+                $possible_values{ $row->{ $foreign_key->{key_column} } }
+                    = $row->{ $foreign_key->{label_column} };
+            }
+            $constrain_values{$name} = \%possible_values;
+
 	} elsif (my $values_from_db = $field->{mysql_values}) {
 	    $constrain_values{$name} = $values_from_db;
 	}
@@ -500,7 +529,10 @@ sub _create_add_edit_route {
 
 	    # TODO: better error handling - options to provide error templates
 	    # etc
-	    return _apply_template("<p>Unable to $verb $args->{record_title}</p>", $args->{'template'});
+	    return _apply_template(
+                "<p>Unable to $verb $args->{record_title}</p>", 
+                $args->{'template'}
+            );
 	}
 
     } else {
@@ -534,11 +566,14 @@ sub _create_list_handler {
 
     my $options = join(
 	"\n",
-	map {	my $selected = (defined params->{searchfield}
-				&& params->{searchfield} eq $_->{COLUMN_NAME})
-				?"selected":"";
-		"<option $selected value='$_->{COLUMN_NAME}'>$_->{COLUMN_NAME}</option>" }
-	    @$columns
+	map {
+	    my $sel =
+		(defined params->{searchfield}
+		    && params->{searchfield} eq $_->{COLUMN_NAME})
+		? "selected"
+		: "";
+	    "<option $sel value='$_->{COLUMN_NAME}'>$_->{COLUMN_NAME}</option>"
+	    } @$columns
     );
 
     my $order_by_param=params->{'o'} || "";
@@ -566,10 +601,35 @@ SEARCHFORM
 
     # Explicitly select the columns we are displaying.  (May have been filtered
     # by display_columns above.)
-    my $select_cols = join(',', 
-        map { database->quote_identifier($_->{'COLUMN_NAME'}) } @$columns);
-    my $add_actions = $args->{editable} ? ", $key_column AS actions" : '';
-    my $query = "SELECT $select_cols $add_actions FROM $table_name";
+    
+    my @select_cols = map { $_->{COLUMN_NAME} } @$columns;
+
+    # If we have some columns declared as foreign keys, though, we don't want to
+    # see the raw values in the result; we'll add JOIN clauses to fetch the info
+    # from the related table, so for now just select the defined label column
+    # from the related table instead of the raw ID value
+    my @foreign_cols;
+    if ($args->{foreign_keys}) {
+        while (my($col, $foreign_key) = each(%{ $args->{foreign_keys} })) {
+            @select_cols = grep { $_ ne $col } @select_cols;
+            my $ftable = database->quote_identifier($foreign_key->{table});
+            my $fcol   = database->quote_identifier($foreign_key->{label_column});
+            my $lcol   = database->quote_identifier(
+                $args->{labels}{$col} || $col
+            );
+            push @foreign_cols, "$ftable.$fcol AS $lcol";
+        }
+    }
+
+
+    my $col_list = join(',', 
+        map( { $table_name . "." .database->quote_identifier($_) } @select_cols ),
+        @foreign_cols, # already assembled from quoted identifiers
+    );
+    my $add_actions = $args->{editable} 
+        ? ", $table_name.$key_column AS actions" 
+        : '';
+    my $query = "SELECT $col_list $add_actions FROM $table_name";
 
     if (params->{'q'}) {
 	my ($column_data)
@@ -593,85 +653,101 @@ SEARCHFORM
 		_construct_url($args->{prefix});
 	}
     }
+    
+    # If we have foreign key relationship info, we need to join on those tables:
+    if ($args->{foreign_keys}) {
+        while (my($col, $foreign_key) = each %{ $args->{foreign_keys} }) {
+            my $ftable = database->quote_identifier($foreign_key->{table});
+            my $lkey   = database->quote_identifier($col);
+            my $rkey   = database->quote_identifier($foreign_key->{key_column});
+            # Identifiers quoted above, and $table_name quoted further up, so
+            # all safe to interpolate
+            $query .= " JOIN $ftable ON $table_name.$lkey = $ftable.$rkey ";
+        }
+    }
 
-	if ($args->{downloadable}) {
-		my $q = params->{'q'} || "";
-		my $sf = params->{searchfield} || "";
-		my $o = params->{'o'} || "";
-		my $d = params->{'d'} || "";
-		my $page = params->{'p'} || 0 ;
+    if ($args->{downloadable}) {
+            my $q = params->{'q'} || "";
+            my $sf = params->{searchfield} || "";
+            my $o = params->{'o'} || "";
+            my $d = params->{'d'} || "";
+            my $page = params->{'p'} || 0 ;
 
-		my @formats = qw/csv tabular json xml/;
+            my @formats = qw/csv tabular json xml/;
 
-		my $url = _construct_url($args->{prefix}) .
-			"?o=$o&d=$d&q=$q&searchfield=$sf&p=$page";
+            my $url = _construct_url($args->{prefix}) .
+                    "?o=$o&d=$d&q=$q&searchfield=$sf&p=$page";
 
-		$html .="<p>Download as: " . join(", ",
-			map { "<a href=\"$url&format=$_\">$_</a>" } @formats ) . "<p>";
-	}
+            $html .="<p>Download as: " . join(", ",
+                    map { "<a href=\"$url&format=$_\">$_</a>" } @formats ) . "<p>";
+    }
 
-	## Build a hash to add sorting CGI parameters + URL to each column header.
-	## (will be used with HTML::Table::FromDatabase's "-rename_columns" parameter.
-	my %columns_sort_options;
-	if ($args->{sortable}) {
-		my $q = params->{'q'} || "";
-		my $sf = params->{searchfield} || "";
-		my $order_by_column = params->{'o'} || $key_column;
-		# Invalid column name ? discard it
-		my $valid = grep { $_->{COLUMN_NAME} eq $order_by_column } @$columns;
-		$order_by_column = $key_column unless $valid;
+    ## Build a hash to add sorting CGI parameters + URL to each column header.
+    ## (will be used with HTML::Table::FromDatabase's "-rename_columns" parameter.
+    my %columns_sort_options;
+    if ($args->{sortable}) {
+        my $q = params->{'q'} || "";
+        my $sf = params->{searchfield} || "";
+        my $order_by_column = params->{'o'} || $key_column;
+        # Invalid column name ? discard it
+        my $valid = grep { $_->{COLUMN_NAME} eq $order_by_column } @$columns;
+        $order_by_column = $key_column unless $valid;
 
-		my $order_by_direction = (exists params->{'d'} && params->{'d'} eq "desc")?"desc":"asc";
-		my $opposite_order_by_direction = ($order_by_direction eq "asc")?"desc":"asc";
+        my $order_by_direction = 
+            (exists params->{'d'} && params->{'d'} eq "desc")
+            ? "desc" : "asc";
+        my $opposite_order_by_direction = 
+            ($order_by_direction eq "asc")
+            ? "desc" : "asc";
 
-		%columns_sort_options = map {
-			my $col_name = $_->{COLUMN_NAME};
-			my $direction = $order_by_direction;
-			my $direction_char = "";
-			if ($col_name eq $order_by_column) {
-				$direction = $opposite_order_by_direction;
-				$direction_char = ($direction eq "asc")?"&uarr;":"&darr;";
-			}
-			my $url = _construct_url($args->{prefix}) .
-				"?o=$col_name&d=$direction&q=$q&searchfield=$sf";
-			$col_name => "<a href=\"$url\">$col_name&nbsp;$direction_char</a>";
-			} @$columns;
+        %columns_sort_options = map {
+            my $col_name = $_->{COLUMN_NAME};
+            my $direction = $order_by_direction;
+            my $direction_char = "";
+            if ($col_name eq $order_by_column) {
+                    $direction = $opposite_order_by_direction;
+                    $direction_char = ($direction eq "asc")?"&uarr;":"&darr;";
+            }
+            my $url = _construct_url($args->{prefix}) .
+                    "?o=$col_name&d=$direction&q=$q&searchfield=$sf";
+            $col_name => "<a href=\"$url\">$col_name&nbsp;$direction_char</a>";
+        } @$columns;
 
-	    $query .= " ORDER BY " . database->quote_identifier($order_by_column) .
-			" " .$order_by_direction . " " ;
-	}
+        $query .= " ORDER BY " . database->quote_identifier($order_by_column)
+                . " " . $order_by_direction . " ";
+    }
 
-	if ($args->{paginate} && $args->{paginate} =~ /^\d+$/ ) {
-		my $page_size = $args->{paginate};
+    if ($args->{paginate} && $args->{paginate} =~ /^\d+$/ ) {
+            my $page_size = $args->{paginate};
 
-		my $q = params->{'q'} || "";
-		my $sf = params->{searchfield} || "";
-		my $o = params->{'o'} || "";
-		my $d = params->{'d'} || "";
-		my $page = params->{'p'} || 0 ;
-		$page = 0 unless $page =~ /^\d+$/;
+            my $q = params->{'q'} || "";
+            my $sf = params->{searchfield} || "";
+            my $o = params->{'o'} || "";
+            my $d = params->{'d'} || "";
+            my $page = params->{'p'} || 0 ;
+            $page = 0 unless $page =~ /^\d+$/;
 
-		my $offset = $page_size * $page ;
-		my $limit = $page_size ;
+            my $offset = $page_size * $page ;
+            my $limit = $page_size ;
 
-		my $url = _construct_url($args->{prefix}) .
-			"?o=$o&d=$d&q=$q&searchfield=$sf";
-		$html .= "<p>";
-		if ($page > 0) {
-			$html .= sprintf("<a href=\"$url&p=%d\">&larr;&nbsp;prev.&nbsp;page</a>", $page-1)
-		} else {
-			$html .= "&larr;&nbsp;prev.&nbsp;page&nbsp";
-		}
-		$html .= "&nbsp;" x 5;
-		$html .= sprintf("Showing page %d (records %d to %d)",
-				$page+1, $offset+1, $offset+1 + $limit );
-		$html .= "&nbsp;" x 5;
-		$html .= sprintf("<a href=\"$url&p=%d\">next&nbsp;page&nbsp;&rarr;</a>", $page+1);
-		$html .= "<p>";
+            my $url = _construct_url($args->{prefix}) .
+                    "?o=$o&d=$d&q=$q&searchfield=$sf";
+            $html .= "<p>";
+            if ($page > 0) {
+                    $html .= sprintf("<a href=\"$url&p=%d\">&larr;&nbsp;prev.&nbsp;page</a>", $page-1)
+            } else {
+                    $html .= "&larr;&nbsp;prev.&nbsp;page&nbsp";
+            }
+            $html .= "&nbsp;" x 5;
+            $html .= sprintf("Showing page %d (records %d to %d)",
+                            $page+1, $offset+1, $offset+1 + $limit );
+            $html .= "&nbsp;" x 5;
+            $html .= sprintf("<a href=\"$url&p=%d\">next&nbsp;page&nbsp;&rarr;</a>", $page+1);
+            $html .= "<p>";
 
 
-		$query .= " LIMIT $limit OFFSET $offset " ;
-	}
+            $query .= " LIMIT $limit OFFSET $offset " ;
+    }
 
 
 
@@ -714,6 +790,7 @@ SEARCHFORM
 	    },
 	],
 	-rename_headers => \%columns_sort_options,
+        -auto_pretty_headers => 1,
         -html => 'escape',
     );
 

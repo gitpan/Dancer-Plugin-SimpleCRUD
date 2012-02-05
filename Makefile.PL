@@ -15,9 +15,17 @@ WriteMakefile(
         'Test::More' => 0,
         'Dancer'     => 1.3,
         'Dancer::Plugin::Database' => 1.00,
-        'HTML::Table::FromDatabase' => 0.07,
+        'HTML::Table::FromDatabase' => 1.10,
         'CGI::FormBuilder' => 0,
     },
     dist                => { COMPRESS => 'gzip -9f', SUFFIX => 'gz', },
     clean               => { FILES => 'Dancer-Plugin-SimpleCRUD-*' },
+
+    META_MERGE => {
+        resources => {
+            repository => 'https://github.com/bigpresh/Dancer-Plugin-SimpleCRUD',
+            bugtracker => 'https://github.com/bigpresh/Dancer-Plugin-SimpleCRUD/issues',
+            homepage   => 'https://github.com/bigpresh/Dancer-Plugin-SimpleCRUD/wiki/Quick-intro',
+        },
+    },
 );
