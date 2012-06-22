@@ -9,10 +9,8 @@ t/pod-coverage.t
 t/pod.t
 example/config.yml
 example/README.pod
-example/schema.sql
 example/simplecrud-example.pl
 example/test.sqlite
 example/views/contentwrapper.tt
 example/views/layouts/main.tt
-META.yml                                 Module YAML meta-data (added by MakeMaker)
-META.json                                Module JSON meta-data (added by MakeMaker)
+META.yml                                 Module meta-data (added by MakeMaker)
