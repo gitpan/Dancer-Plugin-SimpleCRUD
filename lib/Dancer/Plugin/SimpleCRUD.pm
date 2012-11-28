@@ -36,7 +36,7 @@ use Dancer::Plugin::Database;
 use HTML::Table::FromDatabase;
 use CGI::FormBuilder;
 
-our $VERSION = '0.61';
+our $VERSION = '0.70';
 
 =encoding utf8
 
@@ -394,6 +394,9 @@ CONFIRMDELETE
 }
 
 register simple_crud => \&simple_crud;
+register_hook(qw(
+    add_edit_row
+));
 register_plugin;
 
 sub _create_add_edit_route {
@@ -564,6 +567,11 @@ sub _create_add_edit_route {
         # submitted with the form which don't belong in the DB, ignore them)
         my %params;
         $params{$_} = params->{$_} for @editable_columns;
+
+        # Fire a hook so the user can manipulate the data in a whole range of
+        # cunning ways, if they wish
+        execute_hook('add_edit_row', \%params);
+
         my $verb;
         my $success;
         if (exists params->{$key_column}) {
@@ -1045,6 +1053,15 @@ this field to the choices defined by the ENUM list.  (Unless you've provided a
 set of acceptable values for this field using the C<acceptable_values> option to
 C<simple_crud>, in which case what you say goes.)
 
+=head1 Hooks
+
+=head2 add_edit_row
+
+Fires right before a row is added/edited; receives a hashref of column => value
+which can be modified if you want to massage the data first.
+
+For instance, if you were dealing with a users table, you might want to take the
+password entered and hash it, perhaps.
 
 
 =head1 AUTHOR
