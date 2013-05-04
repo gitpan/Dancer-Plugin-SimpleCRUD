@@ -36,7 +36,7 @@ use Dancer::Plugin::Database;
 use HTML::Table::FromDatabase;
 use CGI::FormBuilder;
 
-our $VERSION = '0.80';
+our $VERSION = '0.90';
 
 =encoding utf8
 
@@ -123,6 +123,14 @@ easy to set up and use.
                     my $search = qq{http://news.google.com/news?q="$division_name"};
                     return "<a href='$search'>$label</a>";
                 },
+            },
+        },
+        auth => {
+            view => {
+                require_login => 1,
+            },
+            edit => {
+                require_role => 1,
             },
         },
     );
@@ -254,12 +262,24 @@ Example:
     }
 
 
+=item C<default_value> (optional)
+
+A hashref of default values to have pre-selected on the add form.
+
+Example:
+
+    default_value => {
+        gender => 'Female',
+        status => 'Unknown',
+    }
+
+
 =item C<editable_columns> (optional)
 
 Specify an arrayref of fields which the user can edit.  By default, this is all
 columns in the database table, with the exception of the key column.
 
-=item <not_editable_columns> (optional)
+=item C<not_editable_columns> (optional)
 
 Specify an arrayref of fields which should not be editable.
 
@@ -339,6 +359,33 @@ If C<raw_column> consists of anything other than letters, numbers, and underscor
 it is passed in raw, so you could put something like "NOW()"  or "datetime('now')"
 in there and it should work as expected.
 
+=item C<auth>
+
+You can require that users be authenticated to view/edit records using the C<auth>
+option to enable authentication powered by L<Dancer::Plugin::Auth::Extensible>.
+
+You can set different requirements for viewing and editing, for example:
+
+    auth => {
+        view => {
+            require_login => 1,
+        },
+        edit => {
+            require_role => 'Admin',
+        },
+    },
+
+The example above means that any logged in user can view records, but only users
+with the 'Admin' role are able to create/edit/delete records.
+
+Or, to just require login for anything (same requirements for both viewing and
+editing), you can use the shorthand:
+
+    auth => {
+        require_login => 1,
+    },
+
+
 =cut
 
 sub simple_crud {
@@ -392,15 +439,25 @@ sub simple_crud {
         = sub { _create_add_edit_route(\%args, $table_name, $key_column); };
 
     if ($args{editable}) {
-        Dancer::Logger::debug("Setting up routes for $args{prefix}/add etc");
-        any ['get', 'post'] => "$args{prefix}/add"      => $handler;
-        any ['get', 'post'] => "$args{prefix}/edit/:id" => $handler;
+        _ensure_auth('edit', $handler, \%args);
+        for ('/add', '/edit/:id') {
+            my $url = _construct_url($args{dancer_prefix}, $args{prefix}, $_);
+            Dancer::Logger::debug("Setting up route for $url");
+            any ['get', 'post'] => $url => $handler;
+        }
     }
 
     # And a route to list records already in the table:
     my $list_handler
-        = sub { _create_list_handler(\%args, $table_name, $key_column); };
-    get "$args{prefix}" => $list_handler;
+        = _ensure_auth(
+            'view',
+            sub { _create_list_handler(\%args, $table_name, $key_column); },
+            \%args,
+        );
+    get _construct_url(
+        $args{dancer_prefix},
+        $args{prefix},
+    ) => $list_handler;
 
     # If we should allow deletion of records, set up routes to handle that,
     # too.
@@ -410,7 +467,9 @@ sub simple_crud {
         # message with a form to submit (this is only for browsers which didn't
         # support Javascript, otherwise the list page will have POSTed the ID
         # to us) (or they just came here directly for some reason)
-        get "$args{prefix}/delete/:id" => sub {
+        get _construct_url(
+            $args{dancer_prefix}, $args{prefix}, "/delete/:id"
+            ) => sub {
             return _apply_template(<<CONFIRMDELETE, $args{'template'});
 <p>
 Do you really wish to delete this record?
@@ -425,15 +484,20 @@ CONFIRMDELETE
         };
 
         # A route for POST requests, to actually delete the record
-        post qr[$args{prefix}/delete/?(.+)?$] => sub {
+        my $del_url_stub = _construct_url(
+            $args{dancer_prefix}, $args{prefix}, '/delete'
+        );
+        my $delete_handler = sub {
             my ($id) = params->{record_id} || splat;
             my $dbh = database($args{db_connection_name});
             $dbh->quick_delete($table_name, { $key_column => $id })
                 or return _apply_template("<p>Failed to delete!</p>",
                 $args{'template'});
 
-            redirect _construct_url($args{prefix});
+            redirect _construct_url($args{dancer_prefix}, $args{prefix});
         };
+        _ensure_auth('edit', $delete_handler, \%args);
+        post qr[$del_url_stub/?(.+)?$] => $delete_handler;
     }
 
 }
@@ -451,9 +515,10 @@ sub _create_add_edit_route {
 
     my $dbh = database($args->{db_connection_name});
 
-    my $default_field_values;
+    # a hash containing the current values in the database
+    my $values_from_database;
     if ($id) {
-        $default_field_values
+        $values_from_database
             = $dbh->quick_select($table_name, { $key_column => $id });
     }
 
@@ -546,7 +611,7 @@ sub _create_add_edit_route {
     my $form = CGI::FormBuilder->new(
         fields   => \@editable_columns,
         params   => $paramsobj,
-        values   => $default_field_values,
+        values   => $values_from_database,
         validate => $validation,
         method   => 'post',
         action   => _construct_url(
@@ -560,9 +625,19 @@ sub _create_add_edit_route {
         ),
     );
     for my $field (@editable_columns) {
+        # values_from_database contains what was in the database for this 
+        # object, if it already existed in the database.  $args->{default_value}
+        # is the default, if any, requested by the user for this field in the 
+        # 'default_value' hash when the route was created.
+        my $default = 
+                exists $values_from_database->{$field}  
+              ? $values_from_database->{$field}
+              : exists $args->{default_value}->{$field} 
+              ? $args->{default_value}->{$field}
+              : '';
         my %field_params = (
             name  => $field,
-            value => $default_field_values->{$field} || '',
+            value => $default,
         );
 
         $field_params{required} = $required_fields{$field};
@@ -925,7 +1000,7 @@ SEARCHFORM
                 transform => sub {
                     my $id = shift;
                     my $action_links;
-                    if ($args->{editable}) {
+                    if ($args->{editable} && _has_permission('edit', $args)) {
                         my $edit_url
                             = _construct_url(
                                 $args->{dancer_prefix}, $args->{prefix}, 
@@ -933,7 +1008,7 @@ SEARCHFORM
                             );
                         $action_links
                             .= qq[<a href="$edit_url" class="edit_link">Edit</a>];
-                        if ($args->{deletable}) {
+                        if ($args->{deletable} && _has_permission('edit', $args)) {
                             my $del_url = _construct_url(
                                 $args->{dancer_prefix}, $args->{prefix},
                                 "/delete/$id"
@@ -956,7 +1031,7 @@ SEARCHFORM
 
     $html .= $table->getTable || '';
 
-    if ($args->{editable}) {
+    if ($args->{editable} && _has_permission('edit', $args)) {
         $html .= sprintf '<a href="%s">Add a new %s</a></p>',
             _construct_url($args->{dancer_prefix}, $args->{prefix}, '/add'), 
             $args->{record_title};
@@ -1107,8 +1182,74 @@ sub _construct_url {
     # slashes, but that shouldn't be an issue here.
     my $url = '/' . join '/', @url_parts;
     $url =~ s{/{2,}}{/}g;
-    return uri_for($url);
+    return $url;
 }
+
+
+
+# Given a mode ("view" or "edit", a handler coderef, and an args coderef, works
+# out if we need to wrap the handler coderef via
+# Dancer::Plugin::Auth::Extensible to ensure authorisation, and if so, does so.
+sub _ensure_auth {
+    my ($mode, $handler, $args) = @_;
+    
+    my $auth_settings = $args->{auth}{$mode} || $args->{auth} || {};
+
+    if (keys %$auth_settings) {
+        Dancer::ModuleLoader->load('Dancer::Plugin::Auth::Extensible')
+            or die "Can't use auth settings without"
+                . " Dancer::Plugin::Auth::Extensible!";
+    } else {
+        # I think this can just be 'return;' given the way it is
+        # used currently, but the other branch returns a $handler,
+        # so this is more consistent
+        return $handler;
+    }
+
+    if ($auth_settings->{require_login}) {
+        return $handler = 
+            Dancer::Plugin::Auth::Extensible::require_login($handler);
+    } else {
+        for my $keyword (qw(require_role require_any_role require_all_roles)) {
+            if (my $val = $auth_settings->{$keyword}) {
+                return $handler = Dancer::Plugin::Auth::Extensible->$keyword(
+                    $val, $handler
+                );
+            }
+        }
+    }
+}
+
+# Given an action (view/edit) and an args coderef, returns whether the user has
+# permission to perform that action (e.g. if require_login is set, checks the
+# user is logged in; if require_role is set, checks they have that role, etc)
+sub _has_permission {
+    my ($mode, $args) = @_;
+    
+    my $auth_settings = $args->{auth}{$mode} || $args->{auth} || {};
+    if (keys %$auth_settings) {
+        Dancer::ModuleLoader->load('Dancer::Plugin::Auth::Extensible')
+            or die "Can't use auth settings without"
+                . " Dancer::Plugin::Auth::Extensible!";
+    } else {
+        # If no auth settings provided, they can do what they like
+        return 1;
+    }
+
+    if ($auth_settings->{require_login}) {
+        return Dancer::Plugin::Auth::Extensible::logged_in_user() ? 1 : 0;
+    }
+
+    if (my $need_role = $auth_settings->{require_role}) {
+        return Dancer::Plugin::Auth::Extensible::user_has_role($need_role);
+    }
+
+    # TODO: handle require_any_role / require_all_roles here
+    warn "TODO: handle require_any_role / requires_all_roles";
+    return 0;
+}
+
+
 
 =back
 
@@ -1116,7 +1257,7 @@ sub _construct_url {
 
 This module tries to do what you'd expect it to do, so you can rock up your web
 app with as little code and effort as possible, whilst still giving you control
-to override its decisions wherever you need to.
+to override its decisions wherever you need to.1
 
 =head2 Field types
 
@@ -1159,6 +1300,9 @@ jasonjayr
 
 Paul Johnson (pjcj)
 
+Rahul Kotamaraju
+
+Michael J South (msouth)
 
 =head1 BUGS
 
