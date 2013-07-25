@@ -36,7 +36,7 @@ use Dancer::Plugin::Database;
 use HTML::Table::FromDatabase;
 use CGI::FormBuilder;
 
-our $VERSION = '0.90';
+our $VERSION = '0.91';
 
 =encoding utf8
 
@@ -261,6 +261,26 @@ Example:
         status => [qw(Alive Dead Zombie Unknown)],
     }
 
+You can automatically create option groups (on a field of type C<select>) by specifying 
+the acceptable values in CGI::FormBuilder's C<[value, label, category]> format, like this:
+
+    acceptable_values => {
+        gender => ['Male', 'Female'],
+        status => [qw(Alive Dead Zombie Unknown)],
+        threat_level => [
+            [ 'child_puke',   'Regurgitation',       'Child'],
+            [ 'child_knee',   'Knee Biter',          'Child'],
+            [ 'teen_eye',     'Eye Roll',            'Adolescent'],
+            [ 'teen_lip',     'Withering Sarcasm',   'Adolescent'],
+            [ 'adult_silent', 'Pointedly Ignore',    'Adult'],
+            [ 'adult_freak',  'Become Very Put Out', 'Adult'],
+        ],
+    }
+
+If you are letting FormBuilder choose the field type, you won't see these categories
+unless you have enough options that it makes the field into a select.  If you want to
+see the categories all the time, you can use the L</input_types> option to force your 
+field to be rendered as a select.
 
 =item C<default_value> (optional)
 
@@ -494,7 +514,7 @@ CONFIRMDELETE
                 or return _apply_template("<p>Failed to delete!</p>",
                 $args{'template'});
 
-            redirect _construct_url($args{dancer_prefix}, $args{prefix});
+            redirect _external_url($args{dancer_prefix}, $args{prefix});
         };
         _ensure_auth('edit', $delete_handler, \%args);
         post qr[$del_url_stub/?(.+)?$] => $delete_handler;
@@ -505,6 +525,8 @@ CONFIRMDELETE
 register simple_crud => \&simple_crud;
 register_hook(qw(
     add_edit_row
+    add_edit_row_pre_save
+    add_edit_row_post_save
 ));
 register_plugin;
 
@@ -614,7 +636,7 @@ sub _create_add_edit_route {
         values   => $values_from_database,
         validate => $validation,
         method   => 'post',
-        action   => _construct_url(
+        action   => _external_url(
             $args->{dancer_prefix},
             $args->{prefix},
             (
@@ -677,6 +699,22 @@ sub _create_add_edit_route {
             $field_params{type} = $override_type;
         }
 
+        # if the constraint on this is an array of arrays,
+        # and there are three elements in the first array in that list,
+        # (which will be intepreted as: value, label, category)
+        # we are going to assume you want optgroups, with the 
+        # third element in each being the category.
+        #
+        # (See the optgroups option in CGI::FormBuilder)
+        if (ref($field_params{options}) eq 'ARRAY') {
+            if (ref( $field_params{options}->[0] )  eq 'ARRAY') {
+                if (@{ $field_params{options}->[0] } == 3) {
+                    $field_params{optgroups} = 1;
+                }
+            }
+        }
+
+
         # OK, add the field to the form:
         $form->field(%field_params);
     }
@@ -689,9 +727,16 @@ sub _create_add_edit_route {
         my %params;
         $params{$_} = params->{$_} for @editable_columns;
 
+        my $meta_for_hook = {
+            args => $args,
+            params => \%params,
+            table_name => $table_name,
+            key_column => $key_column,
+        };
         # Fire a hook so the user can manipulate the data in a whole range of
         # cunning ways, if they wish
         execute_hook('add_edit_row', \%params);
+        execute_hook('add_edit_row_pre_save', $meta_for_hook);
 
         my $verb;
         my $success;
@@ -703,19 +748,35 @@ sub _create_add_edit_route {
             $verb = 'update';
         } else {
             $success = $dbh->quick_insert($table_name, \%params);
+            # pass them *this* dbh instance so that they can call last_insert_id()
+            # against it if they need to.  last_insert_id in some instances requires
+            # catalog, schema, etc args, so we can't just call it and save the result.
+            # important that we don't do any more database operations that would change
+            # last_insert_id between here and the hook, or this won'w work.
+            $meta_for_hook->{dbh} = $dbh;
             $verb = 'create new';
         }
 
+        $meta_for_hook->{success} = $success;
+        $meta_for_hook->{verb} = $verb;
         if ($success) {
 
             # Redirect to the list page
             # TODO: pass a param to cause it to show a message?
-            redirect _construct_url($args->{dancer_prefix}, $args->{prefix});
+            execute_hook('add_edit_row_post_save', $meta_for_hook);
+            redirect _external_url($args->{dancer_prefix}, $args->{prefix});
             return;
         } else {
-
+            execute_hook('add_edit_row_post_save', $meta_for_hook);
             # TODO: better error handling - options to provide error templates
             # etc
+            # (below is one approach to that TODO--this, or perhaps the hook could return a hash
+            # that would specify these overrides?  Probably best to come up with a complete mechanism
+            # consistent across hooks before we implement.)
+            # return _apply_template(
+            #    $meta_for_hook->{return}{error_message}  || "<p>Unable to $verb $args->{record_title}</p>",
+            #    $meta_for_hook->{return}{error_template} || $args->{error_template} || $args->{'template'}
+            #);
             return _apply_template(
                 "<p>Unable to $verb $args->{record_title}</p>",
                 $args->{'template'});
@@ -790,17 +851,34 @@ SEARCHFORM
     # If we have some columns declared as foreign keys, though, we don't want to
     # see the raw values in the result; we'll add JOIN clauses to fetch the info
     # from the related table, so for now just select the defined label column
-    # from the related table instead of the raw ID value
+    # from the related table instead of the raw ID value.
+
+    # This _as_simplecrud_fk_ mechanism is clearly a bit of a hack.  At some point we
+    # might want to pull in an existing solution for this--this is simple and
+    # may have pitfalls that have already been solved in Catalyst/DBIC code.
+    # For now, we're going with simple. git show 14cec4ea647 to see the
+    # basic change (that's previous to the add of LEFT to the JOIN, though), if you want
+    # to know exactly what to pull out when replacing this
+
     my @foreign_cols;
+    my %fk_alias; # foreign key aliases for cases where we might have collisions
     if ($args->{foreign_keys}) {
+        my $seen_table = {$table_name=>1};
         while (my ($col, $foreign_key) = each(%{ $args->{foreign_keys} })) {
             @select_cols = grep { $_ ne $col } @select_cols;
-            my $ftable = $dbh->quote_identifier($foreign_key->{table});
+            my $raw_ftable = $foreign_key->{table};
+            my $ftable_alias;
+            if ($seen_table->{$raw_ftable}++) {
+                $ftable_alias = $fk_alias{ $col } = $dbh->quote_identifier($raw_ftable. "_as_simplecrud_fk_$seen_table->{$raw_ftable}");
+            }
+            my $ftable = $dbh->quote_identifier($raw_ftable);
             my $fcol
                 = $dbh->quote_identifier($foreign_key->{label_column});
             my $lcol
                 = $dbh->quote_identifier($args->{labels}{$col} || $col);
-            push @foreign_cols, "$ftable.$fcol AS $lcol";
+
+            my $table_or_alias = $fk_alias{ $col } || $ftable;
+            push @foreign_cols, "$table_or_alias.$fcol AS $lcol";
         }
     }
 
@@ -840,7 +918,15 @@ SEARCHFORM
 
             # Identifiers quoted above, and $table_name quoted further up, so
             # all safe to interpolate
-            $query .= " JOIN $ftable ON $table_name.$lkey = $ftable.$rkey ";
+            my $what_to_join = $ftable;
+            my $join_reference = $ftable;
+            if (my $alias = $fk_alias{$col}) {
+                $what_to_join = " $ftable AS $alias ";
+                $join_reference = $alias;
+            }
+            # If this join is not a left join, the list view only shows rows where the
+            # foreign key is defined and matching a row
+            $query .= " LEFT JOIN $what_to_join ON $table_name.$lkey = $join_reference.$rkey ";
         }
     }
 
@@ -871,7 +957,7 @@ SEARCHFORM
                 "<p>Showing results from searching for '%s' in '%s'",
                 params->{'q'}, params->{searchfield});
             $html .= sprintf '&mdash;<a href="%s">Reset search</a></p>',
-                _construct_url($args->{dancer_prefix}, $args->{prefix});
+                _external_url($args->{dancer_prefix}, $args->{prefix});
         }
     }
 
@@ -884,7 +970,7 @@ SEARCHFORM
 
         my @formats = qw/csv tabular json xml/;
 
-        my $url = _construct_url($args->{dancer_prefix}, $args->{prefix})
+        my $url = _external_url($args->{dancer_prefix}, $args->{prefix})
             . "?o=$o&d=$d&q=$q&searchfield=$sf&p=$page";
 
         $html
@@ -920,7 +1006,7 @@ SEARCHFORM
                 $direction = $opposite_order_by_direction;
                 $direction_char = ($direction eq "asc") ? "&uarr;" : "&darr;";
             }
-            my $url = _construct_url($args->{dancer_prefix}, $args->{prefix})
+            my $url = _external_url($args->{dancer_prefix}, $args->{prefix})
                 . "?o=$col_name&d=$direction&q=$q&searchfield=$sf";
             $col_name =>
                 "<a href=\"$url\">$col_name&nbsp;$direction_char</a>";
@@ -945,7 +1031,7 @@ SEARCHFORM
         my $offset = $page_size * $page;
         my $limit  = $page_size;
 
-        my $url = _construct_url($args->{dancer_prefix}, $args->{prefix})
+        my $url = _external_url($args->{dancer_prefix}, $args->{prefix})
             . "?o=$o&d=$d&q=$q&searchfield=$sf";
         $html .= "<p>";
         if ($page > 0) {
@@ -1002,14 +1088,14 @@ SEARCHFORM
                     my $action_links;
                     if ($args->{editable} && _has_permission('edit', $args)) {
                         my $edit_url
-                            = _construct_url(
+                            = _external_url(
                                 $args->{dancer_prefix}, $args->{prefix}, 
                                 "/edit/$id"
                             );
                         $action_links
                             .= qq[<a href="$edit_url" class="edit_link">Edit</a>];
                         if ($args->{deletable} && _has_permission('edit', $args)) {
-                            my $del_url = _construct_url(
+                            my $del_url =_external_url(
                                 $args->{dancer_prefix}, $args->{prefix},
                                 "/delete/$id"
                             );
@@ -1033,13 +1119,13 @@ SEARCHFORM
 
     if ($args->{editable} && _has_permission('edit', $args)) {
         $html .= sprintf '<a href="%s">Add a new %s</a></p>',
-            _construct_url($args->{dancer_prefix}, $args->{prefix}, '/add'), 
+            _external_url($args->{dancer_prefix}, $args->{prefix}, '/add'),
             $args->{record_title};
 
         # Append a little Javascript which asks for confirmation that they'd
         # like to delete the record, then makes a POST request via a hidden
         # form.  This could be made AJAXy in future.
-        my $del_action = _construct_url(
+        my $del_action = _external_url(
             $args->{dancer_prefix}, $args->{prefix}, '/delete'
         );
         $html .= <<DELETEJS;
@@ -1185,7 +1271,14 @@ sub _construct_url {
     return $url;
 }
 
-
+sub _external_url {
+    if ( plugin_setting()->{use_old_url_scheme} ) {
+        return _construct_url(@_);
+    }
+    else {
+        return uri_for(_construct_url(@_));
+    }
+}
 
 # Given a mode ("view" or "edit", a handler coderef, and an args coderef, works
 # out if we need to wrap the handler coderef via
@@ -1257,7 +1350,7 @@ sub _has_permission {
 
 This module tries to do what you'd expect it to do, so you can rock up your web
 app with as little code and effort as possible, whilst still giving you control
-to override its decisions wherever you need to.1
+to override its decisions wherever you need to.
 
 =head2 Field types
 
@@ -1273,14 +1366,29 @@ C<simple_crud>, in which case what you say goes.)
 
 =head1 Hooks
 
-=head2 add_edit_row
+=head2 add_edit_row (deprecated, use add_edit_row_pre_save)
 
-Fires right before a row is added/edited; receives a hashref of column => value
-which can be modified if you want to massage the data first.
+You can use the same code from your add_edit_row hook in an add_edit_row_pre_save
+hook.  The only modification is that the new hook passes the editable params
+as a key of the first argument (called C<params>), rather than as the first
+argument itself.  So, if your hook had C<my $args = shift;>, it could just
+use C<< my $args = shift->{params}; >> and it should work the same way.
 
-For instance, if you were dealing with a users table, you might want to take the
-password entered and hash it, perhaps.
+=head2 add_edit_row_pre_save, add_edit_row_post_save
 
+These fire right before and after a row is added/edited; a hashref is
+passed with metadata such as the name of the table (in C<table_name>), the
+args from the original route setup (C<args>), the table's key column
+(C<key_column>), and the values of the editable params (C<params>).
+
+In the post-save hook, you are also sent C<success> (the return value of
+quick_insert or quick_update) telling you if the save was successful,
+C<dbh> giving you the instance of the handle used to save the entity
+(so you can access last_insert_id()), and C<verb> (currently either
+'create new' or 'update').
+
+For instance, if you were dealing with a users table, you could use the
+pre_save hook to hash the password before storing it.
 
 =head1 AUTHOR
 
