@@ -35,8 +35,9 @@ use Dancer qw(:syntax);
 use Dancer::Plugin::Database;
 use HTML::Table::FromDatabase;
 use CGI::FormBuilder;
+use HTML::Entities;
 
-our $VERSION = '0.92';
+our $VERSION = '0.93';
 
 =encoding utf8
 
@@ -248,6 +249,20 @@ A hashref of field_name => message to show when Javascript validation fails.
 
 Default message is "- Invalid entry for the "$fieldname" field".  See above for
 example.
+
+=item C<sort_options> (optional)
+
+A hashref of field_name => optionspec indicating how select options should be sorted
+
+This is currently a passthrough to L<CGI::FormBuilder>'s L<sortopts|CGI::FormBuilder/sortopts>.  There are several
+built-in values:
+
+    NAME            Sort option values by name
+    NUM             Sort option values numerically
+    LABELNAME       Sort option labels by name
+    LABELNUM        Sort option labels numerically
+
+See the documentation for L<CGI::FormBuilder/sortopts> for more.
 
 =item C<acceptable_values> (optional)
 
@@ -671,10 +686,11 @@ sub _create_add_edit_route {
         # Certain options in $args simply cause that value to be added to the
         # params for this field we'll pass to $form->field:
         my %option_map = (
-            labels     => 'label',
-            validation => 'validate',
-            message    => 'message',
-            jsmessage  => 'jsmessage',
+            labels        => 'label',
+            validation    => 'validate',
+            message       => 'message',
+            jsmessage     => 'jsmessage',
+            sort_options  => 'sortopts',
         );
         while (my ($arg_name, $field_param_name) = each(%option_map)) {
             if (my $val = $args->{$arg_name}{$field}) {
@@ -898,7 +914,9 @@ SEARCHFORM
 
     my $col_list = join(
         ',',
-        map({ $table_name . "." . $dbh->quote_identifier($_) }
+        map({ $table_name . "." . $dbh->quote_identifier($_) . " AS " .
+                  $dbh->quote_identifier($args->{labels}{$_} || $_)
+            }
             @select_cols),
         @foreign_cols,    # already assembled from quoted identifiers
         @custom_cols,
@@ -955,7 +973,7 @@ SEARCHFORM
             $html
                 .= sprintf(
                 "<p>Showing results from searching for '%s' in '%s'",
-                params->{'q'}, params->{searchfield});
+                encode_entities(params->{'q'}), encode_entities(params->{searchfield}));
             $html .= sprintf '&mdash;<a href="%s">Reset search</a></p>',
                 _external_url($args->{dancer_prefix}, $args->{prefix});
         }
@@ -990,6 +1008,7 @@ SEARCHFORM
         # Invalid column name ? discard it
         my $valid = grep { $_->{COLUMN_NAME} eq $order_by_column } @$columns;
         $order_by_column = $key_column unless $valid;
+        my $order_by_table = $table_name;
 
         my $order_by_direction
             = (exists params->{'d'} && params->{'d'} eq "desc")
@@ -1000,6 +1019,7 @@ SEARCHFORM
 
         %columns_sort_options = map {
             my $col_name       = $_->{COLUMN_NAME};
+            my $col = $args->{labels}{$col_name} || $col_name;
             my $direction      = $order_by_direction;
             my $direction_char = "";
             if ($col_name eq $order_by_column) {
@@ -1008,14 +1028,19 @@ SEARCHFORM
             }
             my $url = _external_url($args->{dancer_prefix}, $args->{prefix})
                 . "?o=$col_name&d=$direction&q=$q&searchfield=$sf";
-            $col_name =>
-                "<a href=\"$url\">$col_name&nbsp;$direction_char</a>";
+            $col =>
+                "<a href=\"$url\">$col&nbsp;$direction_char</a>";
         } @$columns;
 
-        $query
-            .= " ORDER BY $table_name."
-            . $dbh->quote_identifier($order_by_column) . " "
-            . $order_by_direction . " ";
+        if (exists $args->{foreign_keys} and exists $args->{foreign_keys}{$order_by_column}) {
+                my $fk = $args->{foreign_keys}{$order_by_column};
+                $order_by_column = $fk->{label_column};
+                $order_by_table = $fk->{table};
+        }
+
+        $query .= " ORDER BY "
+            . $dbh->quote_identifier($order_by_table) . "." . $dbh->quote_identifier($order_by_column)
+            . " $order_by_direction ";
     }
 
     if ($args->{paginate} && $args->{paginate} =~ /^\d+$/) {
@@ -1411,6 +1436,8 @@ Paul Johnson (pjcj)
 Rahul Kotamaraju
 
 Michael J South (msouth)
+
+Martijn Lievaart
 
 =head1 BUGS
 
